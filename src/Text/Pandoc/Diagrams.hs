@@ -9,31 +9,27 @@ module Text.Pandoc.Diagrams where
 import           Control.Monad                   (when)
 import           Data.Char                       (toLower)
 import           Data.List                       (delete)
-import           Diagrams.Backend.Cairo
-import           Diagrams.Backend.Cairo.Internal
+import           Diagrams.Backend.PGF
+import           Diagrams.Backend.PGF.Render
 import qualified Diagrams.Builder                as DB
 import           Diagrams.Prelude                (centerXY, pad, (&), (.~))
 import           Diagrams.Size                   (dims)
 import           Linear                          (V2 (..), zero)
-import           System.Directory                (createDirectoryIfMissing)
+import           System.Directory                (createDirectoryIfMissing, getDirectoryContents)
 import           System.FilePath                 ((<.>), (</>), pathSeparator)
 import           System.IO
 import           Text.Pandoc.Definition
+import qualified Data.ByteString.Builder         as Builder
+import qualified System.FilePath                 as FP
 
 #if __GLASGOW_HASKELL__ < 710
 import Control.Applicative
 #endif
 
 backendExt :: String -> String
-backendExt "beamer" = "pdf"
-backendExt "latex" = "pdf"
-backendExt _ = "png"
-
--- Return output type for a string
-findOutputType :: String -> OutputType
-findOutputType "beamer" = PDF
-findOutputType "latex" = PDF
-findOutputType _ = PNG
+backendExt "beamer" = "pgf"
+backendExt "latex" = "pgf"
+backendExt _ = "pgf"
 
 data Opts = Opts {
     _outFormat    :: String,
@@ -53,11 +49,19 @@ insertDiagrams opts@(Opts _ _ _ absolutePath) (CodeBlock (ident, classes, attrs)
         Below -> [i, bl']
     | "diagram" `elem` classes = (:[]) <$> img
   where
+    bsify '\\' = '/'
+    bsify c    = c
     img = do
         d <- compileDiagram opts attrs code
         return $ case d of
             Left _err     -> Null  -- TODO log an error here
-            Right imgName -> Plain [Image ("",[],[]) [] (if absolutePath then pathSeparator : imgName else imgName,"")] -- no alt text, no title
+            -- Right imgName -> Plain [Image ("",[],[]) [] (if absolutePath then pathSeparator : imgName else imgName,"")] -- no alt text, no title
+            Right imgName ->
+              Plain [RawInline (Format "TeX")
+                      ("\\input{"
+                      ++ map bsify (if absolutePath then pathSeparator : imgName else imgName)
+                      ++ "}"
+                      )]
     bl' = CodeBlock (ident, "haskell":delete "diagram-haskell" classes, attrs) code
     echo = readEcho attrs
 insertDiagrams _ block = return [block]
@@ -69,19 +73,23 @@ insertDiagrams _ block = return [block]
 --   a file name given by a hash of the source code contents
 compileDiagram :: Opts -> [(String,String)] -> String -> IO (Either String String)
 compileDiagram opts attrs src = do
+  let ext = ".pgf" -- FP.takeExtension (_outfile opts)
   ensureDir $ _outDir opts
 
   let
-      bopts :: DB.BuildOpts Cairo V2 Double
+      
+
+      bopts :: DB.BuildOpts PGF V2 Double
       bopts = DB.mkBuildOpts
 
-                Cairo
+                PGF
 
-                zero
+                (zero :: V2 Double)
 
-                ( CairoOptions "default.png"
+                ( PGFOptions
+                  latexSurface
                   (dims $ V2 (widthAttribute attrs) (heightAttribute attrs))
-                  (findOutputType $ _outFormat opts)
+                  False
                   False
                 )
 
@@ -90,19 +98,17 @@ compileDiagram opts attrs src = do
                   [ "Diagrams.TwoD.Types"      -- WHY IS THIS NECESSARY =(
                   , "Diagrams.Core.Points"
                       -- GHC 7.2 bug?  need  V (Point R2) = R2  (see #65)
-                  , "Diagrams.Backend.Cairo"
-                  , "Diagrams.Backend.Cairo.Internal"
+                  , "Diagrams.Backend.PGF"
                   , "Graphics.SVGFonts"
                   , "Data.Typeable"
                   ]
                 & DB.pragmas .~ ["DeriveDataTypeable"]
                 & DB.diaExpr .~ _expression opts
                 & DB.postProcess .~ (pad 1.1 . centerXY)
-                & DB.decideRegen .~
-                  (DB.hashedRegenerate
-                    (\hash opts' -> opts' { _cairoFileName = mkFile hash })
-                    (_outDir opts)
-                  )
+                & DB.decideRegen .~ (DB.hashedRegenerate
+                                      (\hash opts' -> opts')
+                                      (_outDir opts)
+                                    )
 
   res <- DB.buildDiagram bopts
 
@@ -125,7 +131,10 @@ compileDiagram opts attrs src = do
     DB.OK hash out -> do
       hPutStr stderr "O"
       hFlush stderr
-      fst out
+      h <- openFile (mkFile (DB.hashToHexStr hash)) WriteMode
+      Builder.hPutBuilder h out
+      hClose h
+      -- copyFile out (_outfile opts)
       return $ Right (mkFile (DB.hashToHexStr hash))
 
  where
